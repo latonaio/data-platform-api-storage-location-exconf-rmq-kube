@@ -4,10 +4,12 @@ import (
 	"context"
 	dpfm_api_input_reader "data-platform-api-storage-location-exconf-rmq-kube/DPFM_API_Input_Reader"
 	dpfm_api_output_formatter "data-platform-api-storage-location-exconf-rmq-kube/DPFM_API_Output_Formatter"
-	"data-platform-api-storage-location-exconf-rmq-kube/database"
-	"sync"
+	"encoding/json"
 
 	"github.com/latonaio/golang-logging-library-for-data-platform/logger"
+	database "github.com/latonaio/golang-mysql-network-connector"
+	rabbitmq "github.com/latonaio/rabbitmq-golang-client-for-data-platform"
+	"golang.org/x/xerrors"
 )
 
 type ExistenceConf struct {
@@ -24,77 +26,64 @@ func NewExistenceConf(ctx context.Context, db *database.Mysql, l *logger.Logger)
 	}
 }
 
-func (e *ExistenceConf) Conf(input *dpfm_api_input_reader.SDC) *dpfm_api_output_formatter.StorageLocation {
-	businessPartner := *input.StorageLocation.BusinessPartner
-	plant := *input.StorageLocation.Plant
-	storageLocation := *input.StorageLocation.StorageLocation
-	notKeyExistence := make([]dpfm_api_output_formatter.StorageLocation, 0, 1)
-	KeyExistence := make([]dpfm_api_output_formatter.StorageLocation, 0, 1)
+func (e *ExistenceConf) Conf(msg rabbitmq.RabbitmqMessage) interface{} {
+	var ret interface{}
+	ret = map[string]interface{}{
+		"ExistenceConf": false,
+	}
+	input := make(map[string]interface{})
+	err := json.Unmarshal(msg.Raw(), &input)
+	if err != nil {
+		return ret
+	}
 
-	existData := &dpfm_api_output_formatter.StorageLocation{
-		BusinessPartner: businessPartner,
-		Plant:           plant,
-		StorageLocation: storageLocation,
+	_, ok := input["StorageLocation"]
+	if ok {
+		input := &dpfm_api_input_reader.SDC{}
+		err = json.Unmarshal(msg.Raw(), input)
+		ret = e.confStorageLocation(input)
+		goto endProcess
+	}
+
+	err = xerrors.Errorf("can not get exconf check target")
+endProcess:
+	if err != nil {
+		e.l.Error(err)
+	}
+	return ret
+}
+
+func (e *ExistenceConf) confStorageLocation(input *dpfm_api_input_reader.SDC) *dpfm_api_output_formatter.StorageLocation {
+	exconf := dpfm_api_output_formatter.StorageLocation{
+		ExistenceConf: false,
+	}
+	if input.StorageLocation.BusinessPartner == nil {
+		return &exconf
+	}
+	if input.StorageLocation.Plant == nil {
+		return &exconf
+	}
+	if input.StorageLocation.StorageLocation == nil {
+		return &exconf
+	}
+	exconf = dpfm_api_output_formatter.StorageLocation{
+		BusinessPartner: *input.StorageLocation.BusinessPartner,
+		Plant:           *input.StorageLocation.Plant,
+		StorageLocation: *input.StorageLocation.StorageLocation,
 		ExistenceConf:   false,
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if !e.confStorageLocation(businessPartner, plant, storageLocation) {
-			notKeyExistence = append(
-				notKeyExistence,
-				dpfm_api_output_formatter.StorageLocation{businessPartner, plant, storageLocation, false},
-			)
-			return
-		}
-		KeyExistence = append(KeyExistence, dpfm_api_output_formatter.StorageLocation{businessPartner, plant, storageLocation, true})
-	}()
-
-	wg.Wait()
-
-	if len(KeyExistence) == 0 {
-		return existData
-	}
-	if len(notKeyExistence) > 0 {
-		return existData
-	}
-
-	existData.ExistenceConf = true
-	return existData
-}
-
-func (e *ExistenceConf) confStorageLocation(businessPartner int, plant string, storageLocation string) bool {
 	rows, err := e.db.Query(
-		`SELECT StorageLocation 
+		`SELECT FinInstName
 		FROM DataPlatformMastersAndTransactionsMysqlKube.data_platform_plant_storage_location_data 
-		WHERE (BusinessPartner, plant, storageLocation) = (?, ?, ?);`, businessPartner, plant, storageLocation,
+		WHERE (businessPartner, plant, storageLocation) = (?, ?);`, exconf.BusinessPartner, exconf.Plant, exconf.StorageLocation,
 	)
 	if err != nil {
 		e.l.Error(err)
-		return false
+		return &exconf
 	}
-	if err != nil {
-		e.l.Error(err)
-		return false
-	}
+	defer rows.Close()
 
-	for rows.Next() {
-		var businessPartner int
-		var plant string
-		var storageLocation string
-		err := rows.Scan(&storageLocation)
-		if err != nil {
-			e.l.Error(err)
-			continue
-		}
-		if businessPartner == businessPartner {
-			return true
-		}
-		if plant == plant {
-			return true
-		}
-	}
-	return false
+	exconf.ExistenceConf = rows.Next()
+	return &exconf
 }
